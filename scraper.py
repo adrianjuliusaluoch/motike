@@ -28,7 +28,7 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 
-from titles import fix_titles          # your self-learning title fixer, saved as titles.py
+from titles import fix_titles          # self-learning title fixer (titles.py, same folder)
 
 BASE_URL = "https://motifiti.co.ke"
 
@@ -37,7 +37,7 @@ MASTER = f"{DATA_DIR}/cars.parquet"
 CHECKPOINT = f"{DATA_DIR}/checkpoint.parquet"
 STATE = f"{DATA_DIR}/state.json"
 
-MAX_PAGES = int(os.getenv("MAX_PAGES", "0")) or None
+MAX_PAGES = int(os.getenv("MAX_PAGES") or 0) or None     # empty/unset -> all pages
 
 MULTI_WORD_MAKES = [
     "Land Rover", "Alfa Romeo", "Aston Martin", "Rolls Royce", "Great Wall",
