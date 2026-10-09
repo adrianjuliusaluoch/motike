@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "0 21 * * *"       # 21:00 UTC = 00:00 Nairobi (GitHub may start it a few minutes late)
   workflow_dispatch:           # manual "Run workflow" button
+    inputs:
+      max_pages:
+        description: "Limit listing pages for a test run (leave empty for all)"
+        required: false
+        default: ""
 
 permissions:
   contents: write              # lets the job commit data/ back
@@ -19,6 +24,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check files
+        run: |
+          ls -la
+          for f in scraper.py titles.py requirements.txt; do
+            test -f "$f" || { echo "::error::$f is missing from the repo root"; exit 1; }
+          done
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -28,6 +40,8 @@ jobs:
 
       - name: Scrape
         timeout-minutes: 320   # leaves time for the commit step below
+        env:
+          MAX_PAGES: ${{ inputs.max_pages }}
         run: python scraper.py
 
       - name: Commit data
@@ -35,6 +49,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/*.parquet
+          git add -A data/ 2>/dev/null || true
           git diff --staged --quiet || git commit -m "data: $(date -u +%F)"
+          git pull --rebase
           git push
