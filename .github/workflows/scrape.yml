@@ -1,0 +1,40 @@
+name: scrape
+
+on:
+  schedule:
+    - cron: "0 3 * * *"        # 03:00 UTC = 06:00 Nairobi
+  workflow_dispatch:           # manual "Run workflow" button
+
+permissions:
+  contents: write              # lets the job commit data/ back
+
+concurrency:
+  group: scrape
+  cancel-in-progress: false    # never run two at once
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Scrape
+        timeout-minutes: 320   # leaves time for the commit step below
+        run: python scraper.py
+
+      - name: Commit data
+        if: always()           # also saves a checkpoint if the scrape crashed or timed out
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git diff --staged --quiet || git commit -m "data: $(date -u +%F)"
+          git push
