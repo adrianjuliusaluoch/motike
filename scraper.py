@@ -660,7 +660,7 @@ async def run_async(max_pages=MAX_PAGES):
 
             # ---- Phase 2: full scrape of new / relisted cars ----
             tasks = [asyncio.create_task(detail_record(session, sem, u)) for u in full_jobs]
-            bar = tqdm(total=len(tasks), desc="New cars", unit="car", mininterval=10)
+            bar = tqdm(total=len(tasks), desc="New cars", unit="car", mininterval=30)
             done = 0
             for coro in asyncio.as_completed(tasks):
                 url, rec = await coro
@@ -689,13 +689,13 @@ async def run_async(max_pages=MAX_PAGES):
 
                 done += 1
                 save_checkpoint(bar, done, len(tasks))
-                bar.set_postfix(failed=len(failed_urls), sold=n_sold)
+                bar.set_postfix(failed=len(failed_urls), sold=n_sold, refresh=False)
                 bar.update(1)
             bar.close()
 
             # ---- Phase 3: sold-status check on every active car ----
             tasks = [asyncio.create_task(status_record(session, sem, u)) for u in check_jobs]
-            bar = tqdm(total=len(tasks), desc="Status checks", unit="car", mininterval=10)
+            bar = tqdm(total=len(tasks), desc="Status checks", unit="car", mininterval=30)
             done = 0
             for coro in asyncio.as_completed(tasks):
                 url, status = await coro
@@ -718,7 +718,7 @@ async def run_async(max_pages=MAX_PAGES):
 
                 done += 1
                 save_checkpoint(bar, done, len(tasks))
-                bar.set_postfix(failed=len(failed_urls), sold=n_sold, removed=n_removed)
+                bar.set_postfix(failed=len(failed_urls), sold=n_sold, removed=n_removed, refresh=False)
                 bar.update(1)
             bar.close()
             ok = True
