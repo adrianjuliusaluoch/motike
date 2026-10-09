@@ -1,9 +1,7 @@
-name: scrape
+name: MotiKE
 
 on:
-  schedule:
-    - cron: "0 21 * * *"       # 21:00 UTC = 00:00 Nairobi (GitHub may start it a few minutes late)
-  workflow_dispatch:           # manual "Run workflow" button
+  workflow_dispatch:           # triggered by cron-job.org via the GitHub API, or manually
     inputs:
       max_pages:
         description: "Limit listing pages for a test run (leave empty for all)"
