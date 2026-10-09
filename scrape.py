@@ -1,10 +1,14 @@
 # ============================================================
-# Motifiti scraper: incremental tracker for GitHub Actions
+# Motifiti scraper: daily tracker for GitHub Actions
 # Storage: data/cars.parquet (master) + data/checkpoint.parquet (crash recovery)
 #
-# Env vars (all optional):
-#   MAX_PAGES=2       limit listing pages (testing)
-#   RECHECK_DAYS=3    re-fetch listed cars not checked for N days (0 = all, every run)
+# Each run:
+#   1. read all listing pages -> find new cars
+#   2. fully scrape new cars (first_seen = today)
+#   3. re-check EVERY active car's page for Sold/Removed (last_seen = that day)
+#   4. fix make/model/year from titles (titles.py), save parquet
+#
+# Env vars (optional):  MAX_PAGES=2  limit listing pages (testing)
 # ============================================================
 
 import os
@@ -22,6 +26,8 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 
+from titles import fix_titles          # your self-learning title fixer, saved as titles.py
+
 BASE_URL = "https://motifiti.co.ke"
 
 DATA_DIR = "data"
@@ -29,14 +35,13 @@ MASTER = f"{DATA_DIR}/cars.parquet"
 CHECKPOINT = f"{DATA_DIR}/checkpoint.parquet"
 
 MAX_PAGES = int(os.getenv("MAX_PAGES", "0")) or None
-RECHECK_DAYS = int(os.getenv("RECHECK_DAYS", "3"))
 
 MULTI_WORD_MAKES = [
     "Land Rover", "Alfa Romeo", "Aston Martin", "Rolls Royce", "Great Wall",
     "Mercedes Benz", "Mercedes-Benz",
 ]
 
-# Statuses that mean "this car is gone": last_seen gets stamped, rechecks stop
+# Statuses that mean "this car is gone": last_seen gets stamped, checks stop
 FINAL_STATUSES = {"sold", "removed"}
 
 
@@ -203,6 +208,15 @@ def _running_cost_value(grid, label):
     return None
 
 
+def parse_availability(soup) -> str:
+    """The banner only appears when the car is not available (e.g. 'Sold')."""
+    avail = soup.select_one(".vd-availability")
+    if not avail:
+        return "Available"
+    strong = avail.select_one("strong")
+    return _clean(strong.get_text() if strong else avail.get_text()) or "Available"
+
+
 def parse_detail_page(html: str, url: Optional[str] = None) -> DetailRecord:
     soup = BeautifulSoup(html, "lxml")
     rec = DetailRecord(url=url)
@@ -260,13 +274,7 @@ def parse_detail_page(html: str, url: Optional[str] = None) -> DetailRecord:
         rec.price_kes = _num(price_div.get_text())
         rec.negotiable = price_div.select_one(".badge.negotiable") is not None
 
-    # Availability: banner only appears when the car is not available (e.g. "Sold")
-    avail = soup.select_one(".vd-availability")
-    if avail:
-        strong = avail.select_one("strong")
-        rec.availability = _clean(strong.get_text() if strong else avail.get_text()) or "Available"
-    else:
-        rec.availability = "Available"
+    rec.availability = parse_availability(soup)
 
     specs_section = None
     for det in soup.select("details.vd-more"):
@@ -325,7 +333,7 @@ DELAY_SECONDS = 0.25
 RETRIES = 3
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; research-scraper/1.0)"}
-SAVE_EVERY = 250         # write checkpoint.parquet every N detail pages
+SAVE_EVERY = 250         # write checkpoint.parquet every N fetched pages
 
 GONE = object()          # sentinel: page returned 404/410 (listing taken down)
 
@@ -386,15 +394,15 @@ async def probe_last_page(session, sem, cap=1000):
     return lo
 
 
-async def listing_page_rows(session, sem, page):
+async def listing_page_urls(session, sem, page):
     html = await fetch(session, sem, LISTING_PAGE_URL.format(page=page))
     if not isinstance(html, str):
         return page, None
-    return page, parse_listing_page(html)
+    return page, [r.url for r in parse_listing_page(html)]
 
 
 async def detail_record(session, sem, url):
-    """Returns (url, DetailRecord) | (url, GONE) | (url, None on failure)."""
+    """Full scrape. Returns (url, DetailRecord) | (url, GONE) | (url, None on failure)."""
     html = await fetch(session, sem, url)
     if html is GONE:
         return url, GONE
@@ -403,24 +411,34 @@ async def detail_record(session, sem, url):
     return url, parse_detail_page(html, url=url)
 
 
+async def status_record(session, sem, url):
+    """Status check only. Returns (url, availability str) | (url, GONE) | (url, None on failure)."""
+    html = await fetch(session, sem, url)
+    if html is GONE:
+        return url, GONE
+    if html is None:
+        return url, None
+    return url, parse_availability(BeautifulSoup(html, "lxml"))
+
+
 # ============================================================
 # Parquet storage (DuckDB reads/writes, pandas holds the typed frame)
 # ============================================================
 
 FIELDNAMES = [
-    "ref", "url", "title", "year", "make", "model",
+    "ref", "url", "title", "year", "make", "model", "make_source",
     "listing_type", "listed_by", "mini_site_url",
     "mileage_km", "engine_cc", "fuel_type", "transmission",
     "condition", "trade_in_accepted", "asset_financing_available",
     "price_kes", "negotiable", "availability",
-    "first_seen", "last_seen", "last_checked",     # dates stored as YYYY-MM-DD strings
+    "first_seen", "last_seen", "last_checked", "baseline",   # dates are YYYY-MM-DD strings
     "spec_performance", "spec_interior_comfort", "spec_safety",
     "town_kml", "highway_kml", "combined_kml", "fuel_consumption_kml",
     "insurance_kes_per_year",
 ]
 INT_COLS = ["year", "mileage_km", "engine_cc", "price_kes", "insurance_kes_per_year"]
 FLOAT_COLS = ["town_kml", "highway_kml", "combined_kml"]
-BOOL_COLS = ["trade_in_accepted", "asset_financing_available", "negotiable"]
+BOOL_COLS = ["trade_in_accepted", "asset_financing_available", "negotiable", "baseline"]
 STR_COLS = [c for c in FIELDNAMES if c not in INT_COLS + FLOAT_COLS + BOOL_COLS]
 
 
@@ -468,38 +486,19 @@ def write_parquet(df: pd.DataFrame, path: str):
     os.replace(tmp, path)
 
 
-def pick_jobs(master_df: pd.DataFrame, live_df: pd.DataFrame, today: str) -> pd.DataFrame:
-    """Decide which detail pages to fetch, in SQL. Returns (reason, url) rows."""
-    con = duckdb.connect()
-    con.register("master", master_df)
-    con.register("live", live_df)
-    final = ", ".join(f"'{s}'" for s in sorted(FINAL_STATUSES))
-    sql = f"""
-    WITH active AS (SELECT * FROM master WHERE lower(availability) NOT IN ({final}))
-    -- not seen before
-    SELECT 'new' AS reason, l.url FROM live l
-      WHERE l.url NOT IN (SELECT url FROM master)
-    UNION ALL
-    -- was active, no longer on the listing pages: probably sold/removed
-    SELECT 'vanished', a.url FROM active a
-      WHERE a.url NOT IN (SELECT url FROM live)
-    UNION ALL
-    -- listed price differs from what we stored
-    SELECT 'price_changed', a.url FROM active a JOIN live l ON l.url = a.url
-      WHERE l.price_kes IS NOT NULL AND a.price_kes IS DISTINCT FROM l.price_kes
-    UNION ALL
-    -- safety net: still listed but not checked for RECHECK_DAYS days
-    SELECT 'stale', a.url FROM active a JOIN live l ON l.url = a.url
-      WHERE a.last_checked IS NULL
-         OR date_diff('day', CAST(a.last_checked AS DATE), DATE '{today}') >= {RECHECK_DAYS}
-    UNION ALL
-    -- marked Removed (maybe a transient 404) but back on the listing pages
-    SELECT 'relisted', m.url FROM master m JOIN live l ON l.url = m.url
-      WHERE lower(m.availability) = 'removed'
-    """
-    out = con.sql(sql).df()
-    con.close()
-    return out
+def finalize(master: dict):
+    """Fix titles over the whole master, write it, then drop the checkpoint."""
+    if not master:
+        return
+    df = to_frame(list(master.values()))
+    try:
+        fixed = fix_titles(df)
+        df = to_frame(fixed.astype(object).where(fixed.notna(), None).to_dict("records"))
+    except Exception as e:
+        print(f"Title fixing failed ({e!r}); saving titles as scraped")
+    write_parquet(df, MASTER)
+    if os.path.exists(CHECKPOINT):
+        os.remove(CHECKPOINT)
 
 
 # ============================================================
@@ -515,85 +514,95 @@ async def run_async(max_pages=MAX_PAGES):
     if changes:
         print(f"Recovered {len(changes)} rows from {CHECKPOINT}")
         master.update(changes)
-    print(f"Today: {today} | {len(master)} cars in {MASTER}")
+    for r in master.values():
+        if r.get("baseline") is None:        # rows from before this column existed = first-day rows
+            r["baseline"] = True
 
-    sem = asyncio.Semaphore(CONCURRENCY)
-    timeout = aiohttp.ClientTimeout(total=30)
-    connector = aiohttp.TCPConnector(limit=CONCURRENCY)
+    # First day of tracking: every car's first_seen is just "when we started", not its real listing date
+    first_run = all(r.get("first_seen") == today for r in master.values())
+    print(f"Today: {today} | {len(master)} cars in {MASTER}"
+          + (" | baseline run" if first_run else ""))
 
-    async with aiohttp.ClientSession(headers=HEADERS, timeout=timeout, connector=connector) as session:
+    def save_checkpoint(bar, done, total):
+        if done % SAVE_EVERY == 0 and changes:
+            write_parquet(to_frame(list(changes.values())), CHECKPOINT)
+            bar.write(f"Checkpoint saved: {done}/{total} ({len(changes)} rows changed)")
 
-        # ---- Phase 0: how many pages? ----
-        if max_pages is None:
-            max_pages = await detect_last_page(session, sem)
+    failed_urls = []
+    n_new = n_sold = n_removed = 0
+
+    try:
+        sem = asyncio.Semaphore(CONCURRENCY)
+        timeout = aiohttp.ClientTimeout(total=30)
+        connector = aiohttp.TCPConnector(limit=CONCURRENCY)
+
+        async with aiohttp.ClientSession(headers=HEADERS, timeout=timeout, connector=connector) as session:
+
+            # ---- Phase 0: how many listing pages? ----
             if max_pages is None:
-                print("No pagination info on page 1, probing for the last page...")
-                max_pages = await probe_last_page(session, sem)
-        print(f"Listing pages to read: {max_pages}")
+                max_pages = await detect_last_page(session, sem)
+                if max_pages is None:
+                    print("No pagination info on page 1, probing for the last page...")
+                    max_pages = await probe_last_page(session, sem)
+            print(f"Listing pages to read: {max_pages}")
 
-        # ---- Phase 1: listing pages ----
-        page_tasks = [asyncio.create_task(listing_page_rows(session, sem, p))
-                      for p in range(1, max_pages + 1)]
-        results = []
-        bar = tqdm(total=len(page_tasks), desc="Listing pages", unit="page", mininterval=10)
-        for coro in asyncio.as_completed(page_tasks):
-            results.append(await coro)
-            bar.update(1)
-        bar.close()
+            # ---- Phase 1: listing pages ----
+            page_tasks = [asyncio.create_task(listing_page_urls(session, sem, p))
+                          for p in range(1, max_pages + 1)]
+            results = []
+            bar = tqdm(total=len(page_tasks), desc="Listing pages", unit="page", mininterval=10)
+            for coro in asyncio.as_completed(page_tasks):
+                results.append(await coro)
+                bar.update(1)
+            bar.close()
 
-        live_price, failed_pages, empty_pages = {}, [], []
-        for page, rows in sorted(results, key=lambda r: r[0]):
-            if rows is None:
-                failed_pages.append(page)
-                continue
-            if not rows:
-                empty_pages.append(page)
-            for r in rows:
-                live_price.setdefault(r.url, r.price_kes)
+            live, seen, failed_pages, empty_pages = [], set(), [], []
+            for page, page_urls in sorted(results, key=lambda r: r[0]):
+                if page_urls is None:
+                    failed_pages.append(page)
+                    continue
+                if not page_urls:
+                    empty_pages.append(page)
+                for u in page_urls:
+                    if u not in seen:
+                        seen.add(u)
+                        live.append(u)
 
-        if not live_price:
-            raise RuntimeError("No listings found on any page; aborting so nothing is mis-marked.")
+            if not live:
+                raise RuntimeError("No listings found on any page; aborting.")
 
-        live_df = pd.DataFrame({
-            "url": list(live_price),
-            "price_kes": pd.array(list(live_price.values()), dtype="Int64"),
-        })
+            # ---- Decide what to fetch ----
+            new_urls = [u for u in live if u not in master]
+            relisted = [u for u in live if u in master
+                        and (master[u]["availability"] or "").lower() == "removed"]
+            full_jobs = new_urls + relisted
+            full_set = set(full_jobs)
+            # every active car gets a status check (skipping ones already checked today, e.g. after a crash)
+            check_jobs = [u for u, r in master.items()
+                          if not is_final(r["availability"])
+                          and r.get("last_checked") != today
+                          and u not in full_set]
 
-        # ---- Decide what to fetch (DuckDB SQL) ----
-        jobs_all = pick_jobs(to_frame(list(master.values())), live_df, today)
-        reasons = jobs_all.groupby("reason").size().to_dict()
-        jobs = jobs_all.drop_duplicates("url")["url"].tolist()
+            print(f"{len(live)} on listing pages | {len(new_urls)} new | {len(relisted)} relisted | "
+                  f"{len(check_jobs)} to status-check")
+            if failed_pages:
+                print(f"  {len(failed_pages)} listing pages failed: {failed_pages}")
+            if empty_pages:
+                print(f"  {len(empty_pages)} listing pages had 0 cards: {empty_pages[:10]}")
 
-        print(f"{len(live_price)} on listing pages | {len(master)} in master | "
-              f"{len(jobs)} detail fetches {reasons}")
-        if failed_pages:
-            print(f"  {len(failed_pages)} listing pages failed: {failed_pages}")
-        if empty_pages:
-            print(f"  {len(empty_pages)} listing pages had 0 cards: {empty_pages[:10]}")
-
-        # ---- Phase 2: detail pages ----
-        failed_urls = []
-        n_new = n_sold = n_removed = 0
-        tasks = [asyncio.create_task(detail_record(session, sem, u)) for u in jobs]
-        bar = tqdm(total=len(tasks), desc="Detail pages", unit="car", mininterval=10)
-        done = 0
-        try:
+            # ---- Phase 2: full scrape of new / relisted cars ----
+            tasks = [asyncio.create_task(detail_record(session, sem, u)) for u in full_jobs]
+            bar = tqdm(total=len(tasks), desc="New cars", unit="car", mininterval=10)
+            done = 0
             for coro in asyncio.as_completed(tasks):
                 url, rec = await coro
                 old = master.get(url)
 
                 if rec is None:                                   # network failure: retry next run
                     failed_urls.append(url)
-
-                elif rec is GONE:                                 # 404: listing taken down
+                elif rec is GONE:
                     if old is None:
                         failed_urls.append(url)
-                    elif not is_final(old["availability"]):
-                        row = dict(old)
-                        row.update(availability="Removed", last_seen=today, last_checked=today)
-                        master[url] = changes[url] = row
-                        n_removed += 1
-
                 else:
                     row = record_to_row(rec)
                     final = is_final(row["availability"])
@@ -601,27 +610,55 @@ async def run_async(max_pages=MAX_PAGES):
                     row["last_seen"] = today if final else None
                     if old is None:
                         row["first_seen"] = today
+                        row["baseline"] = first_run
                         n_new += 1
-                    else:
+                    else:                                         # relisted: keep original history
                         row["first_seen"] = old.get("first_seen") or today
+                        row["baseline"] = old.get("baseline")
                     if final:
                         n_sold += 1
                     master[url] = changes[url] = row
 
                 done += 1
-                if done % SAVE_EVERY == 0 and changes:
-                    write_parquet(to_frame(list(changes.values())), CHECKPOINT)
-                    bar.write(f"Checkpoint saved: {done}/{len(tasks)} ({len(changes)} rows changed)")
+                save_checkpoint(bar, done, len(tasks))
+                bar.set_postfix(failed=len(failed_urls), sold=n_sold)
+                bar.update(1)
+            bar.close()
+
+            # ---- Phase 3: sold-status check on every active car ----
+            tasks = [asyncio.create_task(status_record(session, sem, u)) for u in check_jobs]
+            bar = tqdm(total=len(tasks), desc="Status checks", unit="car", mininterval=10)
+            done = 0
+            for coro in asyncio.as_completed(tasks):
+                url, status = await coro
+                old = master[url]
+
+                if status is None:                                # network failure: retry next run
+                    failed_urls.append(url)
+                else:
+                    row = dict(old)
+                    if status is GONE:                            # 404: listing taken down
+                        row.update(availability="Removed", last_seen=today, last_checked=today)
+                        n_removed += 1
+                    else:
+                        final = is_final(status)
+                        row.update(availability=status, last_checked=today,
+                                   last_seen=today if final else None)
+                        if final:
+                            n_sold += 1
+                    master[url] = changes[url] = row
+
+                done += 1
+                save_checkpoint(bar, done, len(tasks))
                 bar.set_postfix(failed=len(failed_urls), sold=n_sold, removed=n_removed)
                 bar.update(1)
-        finally:
             bar.close()
-            write_parquet(to_frame(list(master.values())), MASTER)
-            if os.path.exists(CHECKPOINT):
-                os.remove(CHECKPOINT)
+
+    finally:
+        finalize(master)
 
     print(f"Done -> {MASTER}  ({len(master)} total | {n_new} new | "
-          f"{n_sold} now sold | {n_removed} removed | {len(failed_urls)} failed)")
+          f"{n_sold} sold | {n_removed} removed | {len(failed_urls)} failed)")
     return failed_urls
 
 
