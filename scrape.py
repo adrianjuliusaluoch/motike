@@ -1,18 +1,20 @@
 # ============================================================
 # Motifiti scraper: daily tracker for GitHub Actions
 # Storage: data/cars.parquet (master) + data/checkpoint.parquet (crash recovery)
+#          data/state.json (what the site said last run + tracking start)
 #
 # Each run:
-#   1. read all listing pages -> find new cars
+#   1. read page-1 header + all listing pages -> find new cars
 #   2. fully scrape new cars (first_seen = today)
 #   3. re-check EVERY active car's page for Sold/Removed (last_seen = that day)
-#   4. fix make/model/year from titles (titles.py), save parquet
+#   4. fix make/model/year from titles (titles.py), save parquet + state
 #
 # Env vars (optional):  MAX_PAGES=2  limit listing pages (testing)
 # ============================================================
 
 import os
 import re
+import json
 import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -33,6 +35,7 @@ BASE_URL = "https://motifiti.co.ke"
 DATA_DIR = "data"
 MASTER = f"{DATA_DIR}/cars.parquet"
 CHECKPOINT = f"{DATA_DIR}/checkpoint.parquet"
+STATE = f"{DATA_DIR}/state.json"
 
 MAX_PAGES = int(os.getenv("MAX_PAGES", "0")) or None
 
@@ -45,8 +48,12 @@ MULTI_WORD_MAKES = [
 FINAL_STATUSES = {"sold", "removed"}
 
 
+def now_nairobi() -> datetime:
+    return datetime.now(ZoneInfo("Africa/Nairobi"))
+
+
 def today_str() -> str:
-    return datetime.now(ZoneInfo("Africa/Nairobi")).date().isoformat()
+    return now_nairobi().date().isoformat()
 
 
 def is_final(status) -> bool:
@@ -164,6 +171,27 @@ def parse_listing_page(html: str):
     soup = BeautifulSoup(html, "lxml")
     cards = soup.select("a.public-listing-row")
     return [parse_listing_card(c) for c in cards]
+
+
+def parse_header(html: str):
+    """'3399 cars listed · page 1 of 142' -> (3399, 142). Either may be None."""
+    soup = BeautifulSoup(html, "lxml")
+    text = soup.get_text(" ", strip=True)
+    total = last = None
+
+    m = re.search(r"([\d,]+)\s+cars?\s+listed", text, re.I)
+    if m:
+        total = int(m.group(1).replace(",", ""))
+
+    m = re.search(r"page\s+\d+\s+of\s+(\d+)", text, re.I)
+    if m:
+        last = int(m.group(1))
+    else:                                        # fallback: highest ?page=N link
+        nums = [int(x.group(1)) for a in soup.select("a[href*='page=']")
+                if (x := re.search(r"[?&]page=(\d+)", a.get("href", "")))]
+        last = max(nums) if nums else None
+
+    return total, last
 
 
 # ============================================================
@@ -358,23 +386,12 @@ async def fetch(session, sem, url):
     return None
 
 
-async def detect_last_page(session, sem):
+async def read_header(session, sem):
+    """Page-1 header -> (total_listed, last_page); (None, None) if page 1 can't be read."""
     html = await fetch(session, sem, LISTING_PAGE_URL.format(page=1))
     if not isinstance(html, str):
-        raise RuntimeError("Could not fetch listing page 1")
-    soup = BeautifulSoup(html, "lxml")
-    candidates = []
-
-    m = re.search(r"page\s+\d+\s+of\s+(\d+)", soup.get_text(" ", strip=True), re.I)
-    if m:
-        candidates.append(int(m.group(1)))
-
-    for a in soup.select("a[href*='page=']"):
-        m = re.search(r"[?&]page=(\d+)", a.get("href", ""))
-        if m:
-            candidates.append(int(m.group(1)))
-
-    return max(candidates) if candidates else None
+        return None, None
+    return parse_header(html)
 
 
 async def probe_last_page(session, sem, cap=1000):
@@ -419,6 +436,26 @@ async def status_record(session, sem, url):
     if html is None:
         return url, None
     return url, parse_availability(BeautifulSoup(html, "lxml"))
+
+
+# ============================================================
+# State (what the site said last run + when tracking began)
+# ============================================================
+
+def load_state() -> dict:
+    try:
+        with open(STATE, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(state: dict):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, sort_keys=True)
+    os.replace(tmp, STATE)
 
 
 # ============================================================
@@ -508,28 +545,34 @@ def finalize(master: dict):
 async def run_async(max_pages=MAX_PAGES):
     today = today_str()
     os.makedirs(DATA_DIR, exist_ok=True)
+    limited = max_pages is not None                      # test run: skip the count comparison
 
+    state = load_state()
     master = {r["url"]: r for r in load_rows(MASTER)}
     changes = {r["url"]: r for r in load_rows(CHECKPOINT)}   # leftover from a crashed run
     if changes:
         print(f"Recovered {len(changes)} rows from {CHECKPOINT}")
         master.update(changes)
     for r in master.values():
-        if r.get("baseline") is None:        # rows from before this column existed = first-day rows
+        if r.get("baseline") is None:        # rows from before this column existed
             r["baseline"] = True
 
-    # First day of tracking: every car's first_seen is just "when we started", not its real listing date
-    first_run = all(r.get("first_seen") == today for r in master.values())
-    print(f"Today: {today} | {len(master)} cars in {MASTER}"
-          + (" | baseline run" if first_run else ""))
+    # Date counting began. Cars first seen on this date have an unknown real listing date ("baseline").
+    if not state.get("tracking_start"):
+        firsts = [r["first_seen"] for r in master.values() if r.get("first_seen")]
+        state["tracking_start"] = min(firsts) if firsts else today
+    is_baseline_day = (today == state["tracking_start"])
+    print(f"Today: {today} | {len(master)} cars in {MASTER} | tracking since {state['tracking_start']}"
+          + (" | baseline day" if is_baseline_day else ""))
+
+    failed_urls = []
+    n_new = n_sold = n_removed = 0
+    ok = False
 
     def save_checkpoint(bar, done, total):
         if done % SAVE_EVERY == 0 and changes:
             write_parquet(to_frame(list(changes.values())), CHECKPOINT)
             bar.write(f"Checkpoint saved: {done}/{total} ({len(changes)} rows changed)")
-
-    failed_urls = []
-    n_new = n_sold = n_removed = 0
 
     try:
         sem = asyncio.Semaphore(CONCURRENCY)
@@ -538,11 +581,22 @@ async def run_async(max_pages=MAX_PAGES):
 
         async with aiohttp.ClientSession(headers=HEADERS, timeout=timeout, connector=connector) as session:
 
-            # ---- Phase 0: how many listing pages? ----
+            # ---- Phase 0: read the site header, compare with last run ----
+            total_listed, header_last = await read_header(session, sem)
+            prev_total, prev_last = state.get("last_total_listed"), state.get("last_page")
+            if total_listed is not None:
+                print(f"Site says: {total_listed} cars listed, {header_last} pages"
+                      + (f" (last run: {prev_total} cars, {prev_last} pages)" if prev_total else ""))
+            else:
+                print("Could not read the page-1 header")
+
             if max_pages is None:
-                max_pages = await detect_last_page(session, sem)
+                max_pages = header_last
+                if max_pages is None and prev_last:
+                    max_pages = prev_last
+                    print(f"Using last run's page count: {max_pages}")
                 if max_pages is None:
-                    print("No pagination info on page 1, probing for the last page...")
+                    print("No pagination info, probing for the last page...")
                     max_pages = await probe_last_page(session, sem)
             print(f"Listing pages to read: {max_pages}")
 
@@ -571,13 +625,27 @@ async def run_async(max_pages=MAX_PAGES):
             if not live:
                 raise RuntimeError("No listings found on any page; aborting.")
 
+            # Remember what the site said (real header values, safe even on test runs)
+            if total_listed is not None:
+                state["last_total_listed"] = total_listed
+            if header_last is not None:
+                state["last_page"] = header_last
+            state["last_live_found"] = len(live)
+
+            # Sanity check: did we actually get (nearly) everything the site claims?
+            if total_listed and not limited:
+                ratio = len(live) / total_listed
+                if ratio < 0.95:
+                    print(f"WARNING: found {len(live)} cars but site claims {total_listed} "
+                          f"({ratio:.0%}). Some listing pages may have failed or shifted.")
+
             # ---- Decide what to fetch ----
             new_urls = [u for u in live if u not in master]
             relisted = [u for u in live if u in master
                         and (master[u]["availability"] or "").lower() == "removed"]
             full_jobs = new_urls + relisted
             full_set = set(full_jobs)
-            # every active car gets a status check (skipping ones already checked today, e.g. after a crash)
+            # every active car gets a status check (skip ones already checked today, e.g. after a crash)
             check_jobs = [u for u, r in master.items()
                           if not is_final(r["availability"])
                           and r.get("last_checked") != today
@@ -610,7 +678,7 @@ async def run_async(max_pages=MAX_PAGES):
                     row["last_seen"] = today if final else None
                     if old is None:
                         row["first_seen"] = today
-                        row["baseline"] = first_run
+                        row["baseline"] = is_baseline_day
                         n_new += 1
                     else:                                         # relisted: keep original history
                         row["first_seen"] = old.get("first_seen") or today
@@ -653,9 +721,14 @@ async def run_async(max_pages=MAX_PAGES):
                 bar.set_postfix(failed=len(failed_urls), sold=n_sold, removed=n_removed)
                 bar.update(1)
             bar.close()
+            ok = True
 
     finally:
         finalize(master)
+        state["last_run_date"] = today
+        state["last_run_at"] = now_nairobi().isoformat(timespec="seconds")
+        state["last_run_ok"] = ok
+        save_state(state)
 
     print(f"Done -> {MASTER}  ({len(master)} total | {n_new} new | "
           f"{n_sold} sold | {n_removed} removed | {len(failed_urls)} failed)")
